@@ -1,5 +1,6 @@
 """TTS — pluggable text-to-speech backends (Piper and Kokoro)."""
 
+import sys
 import wave
 from typing import Dict, Any
 from pathlib import Path
@@ -7,6 +8,51 @@ import numpy as np
 
 
 VOICES_DIR = Path(__file__).resolve().parent.parent / "voices"
+
+# Kokoro v1.0 model files (auto-downloaded if missing)
+KOKORO_MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
+KOKORO_VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
+
+
+def _download_kokoro_models_if_missing() -> bool:
+    """Download Kokoro model and voices to voices/ if not present. Returns True if both files exist (after optional download)."""
+    VOICES_DIR.mkdir(parents=True, exist_ok=True)
+    model_path = VOICES_DIR / "kokoro-v1.0.onnx"
+    voices_path = VOICES_DIR / "voices-v1.0.bin"
+    needed = []
+    if not model_path.exists():
+        needed.append((KOKORO_MODEL_URL, model_path, "kokoro-v1.0.onnx (~311 MB)"))
+    if not voices_path.exists():
+        needed.append((KOKORO_VOICES_URL, voices_path, "voices-v1.0.bin (~30 MB)"))
+    if not needed:
+        return True
+    try:
+        import httpx
+    except ImportError:
+        print("Kokoro: install httpx to auto-download models (pip install httpx)")
+        return False
+    for url, path, label in needed:
+        print(f"Downloading {label} to {path} ...")
+        try:
+            with httpx.stream("GET", url, follow_redirects=True, timeout=60.0) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0)) or None
+                done = 0
+                with open(path, "wb") as f:
+                    for chunk in r.iter_bytes(chunk_size=262144):
+                        f.write(chunk)
+                        done += len(chunk)
+                        if total and total > 0:
+                            pct = 100 * done / total
+                            sys.stdout.write(f"\r  {label}: {pct:.0f}%\r")
+                            sys.stdout.flush()
+            if total:
+                print()
+            print(f"  Saved {path}")
+        except Exception as e:
+            print(f"  Download failed: {e}")
+            return False
+    return True
 
 
 class PiperTTS:
@@ -99,11 +145,12 @@ class KokoroTTS:
             model_path = VOICES_DIR / "kokoro-v1.0.onnx"
             voices_path = VOICES_DIR / "voices-v1.0.bin"
 
-            if not model_path.exists():
-                print(f"Kokoro model not found: {model_path}")
-                return False
-            if not voices_path.exists():
-                print(f"Kokoro voices not found: {voices_path}")
+            if not model_path.exists() or not voices_path.exists():
+                if not _download_kokoro_models_if_missing():
+                    return False
+                model_path = VOICES_DIR / "kokoro-v1.0.onnx"
+                voices_path = VOICES_DIR / "voices-v1.0.bin"
+            if not model_path.exists() or not voices_path.exists():
                 return False
 
             available = ort.get_available_providers()
@@ -165,8 +212,16 @@ TTS = PiperTTS
 
 def create_tts(backend: str = "piper", voice: str = "", speed: float = 1.0,
                piper_voice: str = "en_US-lessac-medium", lang: str = "en-us"):
-    """Factory: create the right TTS backend."""
+    """Factory: create the right TTS backend. Falls back to Piper if Kokoro model is missing."""
     if backend == "kokoro":
-        return KokoroTTS(voice=voice or "af_sarah", speed=speed, lang=lang)
-    else:
-        return PiperTTS(voice=voice or piper_voice, speed=speed)
+        k = KokoroTTS(voice=voice or "af_sarah", speed=speed, lang=lang)
+        if k.load():
+            return k
+        print(
+            "Kokoro model not found (download kokoro-v1.0.onnx and voices-v1.0.bin to voices/). "
+            "Falling back to Piper."
+        )
+        p = PiperTTS(voice=piper_voice, speed=speed)
+        p.load()
+        return p
+    return PiperTTS(voice=voice or piper_voice, speed=speed)

@@ -19,6 +19,7 @@ from pathlib import Path
 from rich.console import Console
 
 from app.audio import kill_pulseaudio
+from app.config import VADConfig
 
 # Suppress noisy ALSA error messages (underrun warnings etc.)
 # The callback reference must be kept alive to avoid segfault from GC.
@@ -34,26 +35,13 @@ except Exception:
     pass
 
 
-# ── Audio constants ───────────────────────────────────────────────
+# ── Audio constants (fixed by hardware, not user-tunable) ────────
 
 SAMPLE_RATE = 16000
+SILERO_CHUNK_SAMPLES = 512  # Silero VAD requires exactly 512 samples (32ms) at 16kHz
 CHANNELS = 1
-CHUNK_MS = 30
-CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_MS / 1000)
-CHUNK_BYTES = CHUNK_SAMPLES * CHANNELS * 2
-
-SPEECH_THRESH = 0.008
-SILENCE_DUR_MS = 500
-LOOKBACK_MS = 250
-MAX_SPEECH_SECS = 15
-
-SILENCE_CHUNKS = int(SILENCE_DUR_MS / CHUNK_MS)
-LOOKBACK_CHUNKS = int(LOOKBACK_MS / CHUNK_MS)
-MAX_CHUNKS = int(MAX_SPEECH_SECS * 1000 / CHUNK_MS)
 
 TTS_BREAKS = frozenset('.,;:!?\n')
-FIRST_CHUNK_WORDS = 3
-MAX_CHUNK_WORDS = 8
 
 
 # ── Audio helpers ─────────────────────────────────────────────────
@@ -149,6 +137,46 @@ def tts_player(tts_obj, tts_q: queue.Queue, sink: Optional[str] = None):
             play_audio(r["audio"], r["sample_rate"], sink=sink)
 
 
+# ── Silero VAD ────────────────────────────────────────────────────
+
+class SileroVAD:
+    """Thin wrapper around the Silero VAD ONNX model."""
+
+    def __init__(self):
+        from silero_vad import load_silero_vad
+        import torch
+        self._model = load_silero_vad(onnx=True)
+        self._torch = torch
+
+    def __call__(self, raw_audio: bytes) -> float:
+        """Return speech probability for raw int16 PCM audio at 16 kHz."""
+        pcm = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768.0
+        tensor = self._torch.from_numpy(pcm)
+        return self._model(tensor, SAMPLE_RATE).item()
+
+    def reset(self):
+        self._model.reset_states()
+
+
+def load_silero(console: Optional[Console] = None) -> Optional[SileroVAD]:
+    """Try to load Silero VAD. Returns wrapper or None on failure."""
+    try:
+        t0 = time.perf_counter()
+        vad = SileroVAD()
+        dt = time.perf_counter() - t0
+        if console:
+            console.print(f"  ✓ Silero VAD (ONNX, loaded in {dt:.1f}s)")
+        return vad
+    except ImportError:
+        if console:
+            console.print("  [yellow]⚠ silero-vad not installed (pip install silero-vad), using energy VAD[/yellow]")
+        return None
+    except Exception as e:
+        if console:
+            console.print(f"  [yellow]⚠ Silero VAD failed to load: {e}, using energy VAD[/yellow]")
+        return None
+
+
 # ── Speech segment ────────────────────────────────────────────────
 
 @dataclass
@@ -167,8 +195,11 @@ class SpeechSegment:
 class MicRecorder:
     """Manages mic recording via parecord/arecord with a background reader thread."""
 
-    def __init__(self, console: Console):
+    def __init__(self, console: Console, chunk_ms: int = 30):
         self.console = console
+        self.chunk_ms = chunk_ms
+        self.chunk_samples = int(SAMPLE_RATE * chunk_ms / 1000)
+        self.chunk_bytes = self.chunk_samples * CHANNELS * 2
         self.audio_q: queue.Queue[bytes] = queue.Queue()
         self.listening = threading.Event()
         self.listening.set()
@@ -234,7 +265,7 @@ class MicRecorder:
 
     def _reader(self):
         while self.alive:
-            raw = self._proc.stdout.read(CHUNK_BYTES)
+            raw = self._proc.stdout.read(self.chunk_bytes)
             if not raw:
                 if self._proc.poll() is not None:
                     err = self._proc.stderr.read().decode(errors="replace").strip()
@@ -270,13 +301,33 @@ class MicRecorder:
 
 # ── VAD loop ──────────────────────────────────────────────────────
 
-def vad_loop(mic: MicRecorder, console: Console) -> Iterator[SpeechSegment]:
+def vad_loop(
+    mic: MicRecorder,
+    console: Console,
+    vad_cfg: Optional[VADConfig] = None,
+    silero: Optional[SileroVAD] = None,
+) -> Iterator[SpeechSegment]:
     """Yields SpeechSegment each time a complete utterance is detected.
+
+    When *silero* is provided, speech detection uses the neural model's
+    probability (much better at rejecting non-speech sounds like coughs,
+    keyboard clicks, and ambient noise).  RMS is still used as a cheap
+    pre-filter to skip dead silence without invoking the model.
 
     The caller is responsible for calling mic.resume() after processing
     each segment (so audio stays paused during STT/LLM/TTS).
     """
-    lookback: deque[bytes] = deque(maxlen=LOOKBACK_CHUNKS)
+    cfg = vad_cfg or VADConfig()
+    chunk_ms = cfg.chunk_ms
+    silence_chunks = int(cfg.silence_duration_ms / chunk_ms)
+    lookback_chunks = int(cfg.lookback_ms / chunk_ms)
+    max_chunks = int(cfg.max_speech_secs * 1000 / chunk_ms)
+
+    use_silero = silero is not None
+    silero_thresh = cfg.silero_threshold
+    rms_silence_floor = 0.002  # below this, skip Silero inference entirely
+
+    lookback: deque[bytes] = deque(maxlen=lookback_chunks)
     speech_raw: list[bytes] = []
     is_speaking = False
     silence_count = 0
@@ -290,7 +341,15 @@ def vad_loop(mic: MicRecorder, console: Console) -> Iterator[SpeechSegment]:
 
         rms = chunk_rms(raw)
 
-        if rms > SPEECH_THRESH:
+        if use_silero:
+            if rms < rms_silence_floor:
+                is_speech = False
+            else:
+                is_speech = silero(raw) > silero_thresh
+        else:
+            is_speech = rms > cfg.speech_threshold
+
+        if is_speech:
             silence_count = 0
             if not is_speaking:
                 is_speaking = True
@@ -299,13 +358,13 @@ def vad_loop(mic: MicRecorder, console: Console) -> Iterator[SpeechSegment]:
                 sys.stdout.write("  🎤 Listening...\r")
                 sys.stdout.flush()
             speech_raw.append(raw)
-            if len(speech_raw) < MAX_CHUNKS:
+            if len(speech_raw) < max_chunks:
                 continue
         else:
             if is_speaking:
                 speech_raw.append(raw)
                 silence_count += 1
-                if silence_count < SILENCE_CHUNKS:
+                if silence_count < silence_chunks:
                     continue
             else:
                 lookback.append(raw)
@@ -318,14 +377,17 @@ def vad_loop(mic: MicRecorder, console: Console) -> Iterator[SpeechSegment]:
         lookback.clear()
         speech_end_t = time.monotonic()
 
-        dur_s = len(captured) * CHUNK_MS / 1000
+        if use_silero:
+            silero.reset()
+
+        dur_s = len(captured) * chunk_ms / 1000
         cap_rms = chunk_rms(b"".join(captured))
 
         sys.stdout.write("                              \r")
         sys.stdout.flush()
         mic.pause()
 
-        if dur_s < 0.3 or cap_rms < 0.005:
+        if dur_s < cfg.min_utterance_secs or cap_rms < cfg.min_utterance_rms:
             console.print(f"[dim]  (noise: {dur_s:.1f}s, rms={cap_rms:.4f})[/dim]")
             mic.resume()
             continue
@@ -352,6 +414,9 @@ def stream_and_speak(
     system_prompt: str,
     pa_sink: Optional[str] = None,
     images_b64: Optional[list[str]] = None,
+    few_shot: Optional[list[dict]] = None,
+    first_chunk_words: int = 3,
+    max_chunk_words: int = 8,
 ) -> tuple[str, float, Optional[float]]:
     """Stream LLM response while chunking text to TTS for real-time playback.
 
@@ -374,7 +439,7 @@ def stream_and_speak(
 
     for chunk_data in llm.generate_stream(
         prompt=prompt, system_prompt=system_prompt,
-        images_b64=images_b64,
+        images_b64=images_b64, few_shot=few_shot,
     ):
         content, meta = chunk_data if isinstance(chunk_data, tuple) else (chunk_data, {})
         if content:
@@ -387,7 +452,7 @@ def stream_and_speak(
             if tts_q is not None:
                 tts_buf += content
                 words = len(tts_buf.split())
-                limit = FIRST_CHUNK_WORDS if not first_tts_sent else MAX_CHUNK_WORDS
+                limit = first_chunk_words if not first_tts_sent else max_chunk_words
                 hit_break = any(c in content for c in TTS_BREAKS) and words >= 2
                 if hit_break or words >= limit:
                     tts_q.put(tts_buf.strip())

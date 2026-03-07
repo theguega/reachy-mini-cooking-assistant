@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Vision Chat — speak + see, the VLM describes what it sees.
-Mic → energy VAD → [camera capture] → STT → VLM (text + images) → TTS → Speaker
+Mic -> Silero/energy VAD -> [camera capture] -> STT -> VLM (text + images) -> TTS -> Speaker
 
 Usage:
   python3 run_vision_chat.py
@@ -22,21 +22,56 @@ from app.stt import STT
 from app.llm import LLM
 from app.tts import create_tts
 from app.camera import Camera
-from app.pipeline import SAMPLE_RATE, MicRecorder, warmup_stt, vad_loop, stream_and_speak
+from app.pipeline import (
+    SAMPLE_RATE, MicRecorder, warmup_stt, vad_loop, stream_and_speak, load_silero,
+)
 from rich.console import Console
 from rich.panel import Panel
 
 try:
     from reachy_mini import ReachyMini
+    import psutil
     HAS_REACHY = True
 except ImportError:
     HAS_REACHY = False
+    psutil = None
 
 console = Console()
 
 
+def _is_reachy_daemon_running() -> bool:
+    if not psutil:
+        return False
+    for proc in psutil.process_iter(["cmdline"]):
+        try:
+            cmdline = proc.info.get("cmdline") or []
+            for part in cmdline:
+                if "reachy-mini-daemon" in part:
+                    return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
+            continue
+    return False
+
+
+def _kill_reachy_daemon() -> bool:
+    if not psutil:
+        return False
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cmdline = proc.info.get("cmdline") or []
+            for part in cmdline:
+                if "reachy-mini-daemon" in part:
+                    pid = proc.pid
+                    console.print(f"  [yellow]Killing stale Reachy daemon (PID {pid})[/yellow]")
+                    os.kill(pid, signal.SIGKILL)
+                    time.sleep(2)
+                    return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
+            continue
+    return False
+
+
 def _kill_stale_camera_holders(device: int = 0):
-    """Kill any leftover processes holding /dev/videoN (e.g. from Ctrl-Z)."""
     try:
         r = subprocess.run(
             ["fuser", f"/dev/video{device}"],
@@ -55,6 +90,61 @@ def _kill_stale_camera_holders(device: int = 0):
         pass
 
 
+def _connect_reachy(config):
+    """Connect to Reachy Mini using config.reachy settings. Returns ReachyMini or None."""
+    if not HAS_REACHY or not config.reachy.enabled:
+        return None
+
+    rcfg = config.reachy
+    daemon_already_running = _is_reachy_daemon_running()
+
+    for attempt in range(rcfg.daemon_retry_attempts):
+        try:
+            if attempt == 0:
+                console.print("  Connecting to Reachy Mini...")
+            elif attempt == 1:
+                console.print(f"  [dim]Daemon may still be starting, waiting {rcfg.daemon_startup_wait:.0f}s...[/dim]")
+                time.sleep(rcfg.daemon_startup_wait)
+                console.print("  Retrying connection to Reachy Mini...")
+            else:
+                _kill_reachy_daemon()
+                console.print("  Retrying connection (fresh daemon)...")
+
+            reachy = ReachyMini(
+                spawn_daemon=rcfg.spawn_daemon,
+                use_sim=False,
+                timeout=rcfg.timeout,
+                media_backend=rcfg.media_backend,
+            )
+
+            reachy.enable_motors()
+            if rcfg.wake_on_start:
+                if daemon_already_running:
+                    console.print("  Ensuring Reachy Mini is awake...")
+                else:
+                    console.print("  Waking up Reachy Mini...")
+                reachy.wake_up()
+                time.sleep(0.5)
+                try:
+                    reachy.set_target_antenna_joint_positions(rcfg.antenna_rest_position)
+                    time.sleep(0.2)
+                except Exception:
+                    pass
+                console.print("  [green]✓ Reachy Mini awake (head up, camera ready)[/green]")
+            else:
+                console.print("  [green]✓ Reachy Mini connected (wake_on_start=false)[/green]")
+            return reachy
+
+        except Exception as e:
+            err_msg = str(e)
+            if ("localhost and network" in err_msg or "both localhost" in err_msg.lower()) and attempt < rcfg.daemon_retry_attempts - 1:
+                continue
+            console.print(f"  [yellow]⚠ Reachy Mini unavailable: {e}[/yellow]")
+            console.print("  [yellow]  Continuing without robot control[/yellow]")
+            return None
+    return None
+
+
 def main():
     config = Config.load()
 
@@ -65,24 +155,11 @@ def main():
         border_style="cyan",
     ))
 
-    # ── Reachy Mini — wake up so head/camera is upright ──────────
-    reachy = None
-    if HAS_REACHY:
-        try:
-            console.print("  Connecting to Reachy Mini...")
-            reachy = ReachyMini(spawn_daemon=True, use_sim=False, timeout=30.0, media_backend="no_media")
-            reachy.enable_motors()
-            console.print("  Waking up Reachy Mini...")
-            reachy.wake_up()
-            time.sleep(0.5)
-            console.print("  [green]✓ Reachy Mini awake (head up, camera ready)[/green]")
-        except Exception as e:
-            console.print(f"  [yellow]⚠ Reachy Mini unavailable: {e}[/yellow]")
-            console.print("  [yellow]  Continuing without robot control[/yellow]")
-            reachy = None
+    # ── Reachy Mini ──────────────────────────────────────────────
+    reachy = _connect_reachy(config)
 
-    # ── Audio setup ───────────────────────────────────────────────
-    result = find_alsa_device(name_hint=config.audio.input_device or "Reachy Mini")
+    # ── Audio setup ──────────────────────────────────────────────
+    result = find_alsa_device(name_hint=config.audio.input_device or "Reachy Mini Audio")
     if not result:
         console.print("[red]No mic found![/red]")
         return
@@ -110,12 +187,12 @@ def main():
         console.print("[red]  ✗ Camera not found! Check USB webcam.[/red]")
         return
 
-    # ── Register cleanup for all exit signals (including Ctrl-Z) ─
+    # ── Register cleanup for exit signals ────────────────────────
     def _cleanup(signum=None, frame=None):
-        console.print("\n[yellow]Cleaning up...[/yellow]")
+        console.print("\n[yellow]Exiting...[/yellow]")
         cam.close()
         mic.stop()
-        if reachy:
+        if reachy and config.reachy.sleep_on_exit:
             try:
                 reachy.goto_sleep()
                 reachy.disable_motors()
@@ -123,11 +200,11 @@ def main():
                 pass
         sys.exit(0)
 
-    signal.signal(signal.SIGTSTP, _cleanup)  # Ctrl-Z
-    signal.signal(signal.SIGTERM, _cleanup)  # kill
-    signal.signal(signal.SIGHUP, _cleanup)   # terminal closed
+    signal.signal(signal.SIGTSTP, _cleanup)
+    signal.signal(signal.SIGTERM, _cleanup)
+    signal.signal(signal.SIGHUP, _cleanup)
 
-    # ── Load models ───────────────────────────────────────────────
+    # ── Load models ──────────────────────────────────────────────
     console.print("\n[bold]Loading...[/bold]")
 
     stt = STT(
@@ -140,7 +217,14 @@ def main():
     console.print("    CUDA warmup...", end=" ")
     console.print(f"done ({warmup_stt(stt):.1f}s)")
 
+    silero_model = None
+    if config.vad.use_silero:
+        silero_model = load_silero(console)
+    else:
+        console.print("  [dim]Silero VAD disabled, using energy-only VAD[/dim]")
+
     vision_system_prompt = config.vision.system_prompt
+    vision_few_shot = config.vision.few_shot or []
     llm = LLM(
         model=config.llm.model, base_url=config.llm.base_url,
         backend=config.llm.backend, max_tokens=config.llm.max_tokens,
@@ -161,23 +245,25 @@ def main():
     else:
         console.print("  ⚠ TTS unavailable")
 
-    # ── Start mic ─────────────────────────────────────────────────
-    mic = MicRecorder(console)
-    if not mic.start(hw, config.audio.input_device or "Reachy Mini"):
+    # ── Start mic ────────────────────────────────────────────────
+    effective_chunk_ms = 32 if silero_model else config.vad.chunk_ms
+    mic = MicRecorder(console, chunk_ms=effective_chunk_ms)
+    if not mic.start(hw, config.audio.input_device or "Reachy Mini Audio"):
         console.print("[red]Cannot start recording! Check mic.[/red]")
         cam.close()
         return
 
     n_frames = config.vision.frames
+    n_fewshot = len(vision_few_shot) // 2
     console.print(
         f"\n[green bold]Ready — speak anytime! "
         f"({config.vision.capture_fps} fps, {n_frames} frame{'s' if n_frames > 1 else ''} "
-        f"per query, speech-window capture)[/green bold]\n"
+        f"per query{f', {n_fewshot} few-shot pairs' if n_fewshot else ''})[/green bold]\n"
     )
 
-    # ── Main loop ─────────────────────────────────────────────────
+    # ── Main loop ────────────────────────────────────────────────
     try:
-        for segment in vad_loop(mic, console):
+        for segment in vad_loop(mic, console, vad_cfg=config.vad, silero=silero_model):
             t_cam = time.perf_counter()
             captured_frames = cam.get_speech_frames(
                 speech_start=segment.start_time,
@@ -200,6 +286,12 @@ def main():
                 mic.resume()
                 continue
 
+            word_count = len(text.split())
+            if word_count <= 2 and "?" not in text:
+                console.print(f"[dim]  (skipped filler: \"{text}\")[/dim]")
+                mic.resume()
+                continue
+
             n_imgs = len(captured_frames)
             console.print(
                 f'  [green]You:[/green] "{text}" '
@@ -212,6 +304,9 @@ def main():
             full_resp, dt_llm, ttft = stream_and_speak(
                 llm, tts, text, vision_system_prompt, mic.pa_sink,
                 images_b64=captured_frames if captured_frames else None,
+                few_shot=vision_few_shot if vision_few_shot else None,
+                first_chunk_words=config.tts.first_chunk_words,
+                max_chunk_words=config.tts.max_chunk_words,
             )
             console.print()
 
@@ -227,17 +322,17 @@ def main():
             mic.resume()
 
     except KeyboardInterrupt:
-        console.print("\n[yellow]Goodbye![/yellow]")
+        pass
     finally:
+        console.print("\n[yellow]Goodbye![/yellow]")
         mic.stop()
         cam.close()
         stt.unload()
         llm.unload()
         if tts:
             tts.unload()
-        if reachy:
+        if reachy and config.reachy.sleep_on_exit:
             try:
-                console.print("  Reachy Mini going to sleep...")
                 reachy.goto_sleep()
                 reachy.disable_motors()
             except Exception:

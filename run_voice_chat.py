@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Voice Chat — speak anytime, dynamic recording.
-Mic → energy VAD → STT → (RAG) → LLM stream → TTS stream → Speaker
+Mic -> Silero/energy VAD -> STT -> (RAG) -> LLM stream -> TTS stream -> Speaker
 
 Usage:
   python3 run_voice_chat.py            # with RAG
@@ -15,11 +15,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from app.config import Config
-from app.audio import kill_pulseaudio, find_alsa_device
+from app.audio import find_alsa_device
 from app.stt import STT
 from app.llm import LLM
 from app.tts import create_tts
-from app.pipeline import SAMPLE_RATE, MicRecorder, warmup_stt, vad_loop, stream_and_speak
+from app.pipeline import (
+    SAMPLE_RATE, MicRecorder, warmup_stt, vad_loop, stream_and_speak, load_silero,
+)
 from rich.console import Console
 from rich.panel import Panel
 
@@ -38,10 +40,8 @@ def main():
         border_style="cyan",
     ))
 
-    # ── Audio setup ───────────────────────────────────────────────
-    # Don't kill PulseAudio — the Reachy Mini daemon uses SoundDevice which
-    # holds the ALSA device. PulseAudio multiplexes access so both work.
-    result = find_alsa_device(name_hint=config.audio.input_device or "Reachy Mini")
+    # ── Audio setup ──────────────────────────────────────────────
+    result = find_alsa_device(name_hint=config.audio.input_device or "Reachy Mini Audio")
     if not result:
         console.print("[red]No mic found![/red]")
         return
@@ -49,7 +49,7 @@ def main():
     hw = f"hw:{card},{dev}"
     console.print(f"  Mic: {hw} ({mic_name})")
 
-    # ── Load models ───────────────────────────────────────────────
+    # ── Load models ──────────────────────────────────────────────
     console.print("\n[bold]Loading...[/bold]")
 
     stt = STT(
@@ -61,6 +61,12 @@ def main():
     console.print(f"  ✓ STT (faster-whisper, {config.stt.model})")
     console.print("    CUDA warmup...", end=" ")
     console.print(f"done ({warmup_stt(stt):.1f}s)")
+
+    silero_model = None
+    if config.vad.use_silero:
+        silero_model = load_silero(console)
+    else:
+        console.print("  [dim]Silero VAD disabled, using energy-only VAD[/dim]")
 
     llm = LLM(
         model=config.llm.model, base_url=config.llm.base_url,
@@ -101,18 +107,18 @@ def main():
         except Exception as e:
             console.print(f"  ⚠ RAG: {e}")
 
-    # ── Start mic ─────────────────────────────────────────────────
-    mic = MicRecorder(console)
-    if not mic.start(hw, config.audio.input_device or "Reachy Mini"):
+    # ── Start mic ────────────────────────────────────────────────
+    effective_chunk_ms = 32 if silero_model else config.vad.chunk_ms
+    mic = MicRecorder(console, chunk_ms=effective_chunk_ms)
+    if not mic.start(hw, config.audio.input_device or "Reachy Mini Audio"):
         console.print("[red]Cannot start recording! Check mic.[/red]")
         return
 
     console.print("\n[green bold]Ready — speak anytime![/green bold]\n")
 
-    # ── Main loop ─────────────────────────────────────────────────
+    # ── Main loop ────────────────────────────────────────────────
     try:
-        for segment in vad_loop(mic, console):
-            # STT
+        for segment in vad_loop(mic, console, vad_cfg=config.vad, silero=silero_model):
             t_stt = time.perf_counter()
             result = stt.transcribe(segment.audio, sample_rate=SAMPLE_RATE)
             text = result.get("text", "").strip()
@@ -129,7 +135,6 @@ def main():
 
             console.print(f'  [green]You:[/green] "{text}"')
 
-            # RAG augmentation
             prompt = text
             dt_rag = 0.0
             if rag:
@@ -150,12 +155,13 @@ def main():
                 else:
                     console.print("  [dim]  (no relevant chunks)[/dim]")
 
-            # LLM stream + TTS stream
             console.print("  [magenta]Assistant:[/magenta] ", end="")
             sys.stdout.flush()
 
             full_resp, dt_llm, ttft = stream_and_speak(
                 llm, tts, prompt, active_system_prompt, mic.pa_sink,
+                first_chunk_words=config.tts.first_chunk_words,
+                max_chunk_words=config.tts.max_chunk_words,
             )
             console.print()
 

@@ -198,14 +198,19 @@ Models are cached in `~/.cache/huggingface` and reused across runs.
 
 ### TTS voice models
 
-Download to the `voices/` directory:
+**Kokoro TTS (default)** — When you run with `tts.backend: "kokoro"`, the app will download the Kokoro models automatically on first use if they are not in `voices/` (~340 MB total). No manual step required.
+
+To download Kokoro models manually (e.g. before going offline):
 
 ```bash
-# Kokoro TTS (default — higher quality, ~340 MB total)
+# Kokoro (kokoro-v1.0.onnx + voices-v1.0.bin, ~340 MB total)
 wget -P voices/ https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
 wget -P voices/ https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+```
 
-# Piper TTS (lighter alternative, ~61 MB)
+**Piper TTS** (lighter, ~61 MB) — download manually if you use `tts.backend: "piper"`:
+
+```bash
 wget -O voices/en_US-lessac-medium.onnx \
   "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
 ```
@@ -278,15 +283,28 @@ python3 test_reachy_movement.py
 
 ## Configuration
 
-All settings in `config/settings.yaml`. Key sections:
+Configuration lives in two files that work together:
+
+| File | Who edits it | Purpose |
+|------|-------------|---------|
+| `config/settings.yaml` | **Everyone** — users, integrators, developers | Tune thresholds, swap backends, change prompts. Plain YAML, no Python needed. |
+| `app/config.py` | **Developers only** — when adding new config fields | Typed dataclasses that define the schema and fallback defaults. |
+
+**To change a setting** (e.g. VAD threshold, TTS voice, system prompt): edit `config/settings.yaml`.
+
+**To add a new setting**: add the field to the dataclass in `app/config.py` (with a default value), then add the corresponding key in `config/settings.yaml`. The YAML always wins at runtime; the dataclass default is the fallback if a key is missing from YAML.
+
+### Config sections
 
 | Section | What it controls |
 |---------|-----------------|
-| `llm` | LLM server URL, model, temperature, max tokens, system prompt |
+| `llm` | LLM server URL, model, temperature, max tokens, system prompts (with/without RAG) |
 | `stt` | Whisper model size, CUDA device, beam size |
-| `tts` | Backend (kokoro/piper), voice, speed |
+| `tts` | Backend (kokoro/piper), voice, speed, TTS chunking |
 | `audio` | Sample rate, input device name |
-| `vision` | Camera device, resolution, frames per utterance |
+| `vad` | Speech detection thresholds, silence duration, utterance filters |
+| `vision` | Camera device, resolution, frames per utterance, VLM system prompt, few-shot examples |
+| `reachy` | Robot connection, daemon behavior, wake/sleep, antenna position |
 | `rag` | Embedding backend, knowledge directory, chunk settings |
 
 ## Project Structure

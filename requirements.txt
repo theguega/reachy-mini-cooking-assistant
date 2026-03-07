@@ -10,6 +10,9 @@ psutil>=5.9.0
 # Audio I/O
 sounddevice>=0.4.6
 
+# VAD — Silero neural voice activity detection (much better than energy-only)
+silero-vad>=5.1
+
 # LLM client (OpenAI-compatible API)
 httpx>=0.24.0
 

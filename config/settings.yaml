@@ -32,29 +32,66 @@ stt:
   beam_size: 1                        # 1=greedy (fast), 5=beam (quality)
 
 tts:
-  backend: "kokoro"                  # "kokoro" or "piper"
-  voice: "af_sarah"                  # kokoro: af_sarah, af_bella, am_adam, bf_emma, bm_george, etc.
+  backend: "kokoro"                   # "kokoro" or "piper"
+  voice: "af_sarah"                   # kokoro: af_sarah, af_bella, am_adam, bf_emma, bm_george, etc.
   speed: 1.0
-  piper_voice: "en_US-lessac-medium" # used when backend is "piper"
-  lang: "en-us"                      # kokoro language code
+  piper_voice: "en_US-lessac-medium"  # used when backend is "piper"
+  lang: "en-us"                       # kokoro language code
+  first_chunk_words: 3                # words before first TTS chunk is sent
+  max_chunk_words: 8                  # max words per TTS chunk
 
 audio:
   sample_rate: 16000
   channels: 2
   input_device: "Reachy Mini Audio"
 
+vad:
+  use_silero: true                    # true = Silero neural VAD (much better), false = energy-only
+  silero_threshold: 0.75              # speech probability threshold for Silero (raise to reject more noise)
+  speech_threshold: 0.025             # RMS threshold (pre-filter when Silero is on, sole gate when off)
+  silence_duration_ms: 600            # ms of silence to end an utterance
+  lookback_ms: 250                    # ms of audio to prepend before speech onset
+  max_speech_secs: 15                 # max single utterance length
+  chunk_ms: 32                        # audio chunk size (32ms required for Silero, 30ms for energy-only)
+  min_utterance_secs: 0.8             # reject utterances shorter than this (filters coughs/bumps)
+  min_utterance_rms: 0.025            # reject utterances quieter than this (filters background chatter)
+
 vision:
-  camera_device: 0                  # /dev/video0
+  camera_device: 0                    # /dev/video0
   width: 640
   height: 480
-  jpeg_quality: 80                  # JPEG compression (lower = smaller payload)
-  frames: 1                         # max frames to send per utterance (1 for 4K ctx, up to 3 with 8K+ ctx)
-  capture_fps: 3.0                  # background capture rate (frames/sec into ring buffer)
+  jpeg_quality: 80                    # JPEG compression (lower = smaller payload)
+  frames: 1                           # max frames to send per utterance
+  capture_fps: 3.0                    # background capture rate (frames/sec)
   system_prompt: |
-    You are Reachy Mini, a robot with a camera running on a Jetson Orin Nano.
-    You can see through your camera. Describe what you see when asked.
-    Answer in one to two sentences. Be direct and concise.
-    Never use emojis, asterisks, bullet points, markdown, code blocks, or special formatting.
+    You are Reachy Mini, a robot with a camera.
+    An image is always attached. Only use the image when the user asks about what you see, colors, objects, or the scene.
+    Otherwise ignore the image completely and respond naturally.
+    Answer in one short sentence. No markdown or formatting.
+  few_shot:
+    - role: "user"
+      content: "Hi!"
+    - role: "assistant"
+      content: "Hello!"
+    - role: "user"
+      content: "Thank you so much."
+    - role: "assistant"
+      content: "You're welcome!"
+    - role: "user"
+      content: "Okay, bye!"
+    - role: "assistant"
+      content: "Goodbye, see you later!"
+
+reachy:
+  enabled: true                       # set false to skip robot connection entirely
+  spawn_daemon: true
+  timeout: 30.0                       # Zenoh connection timeout (seconds)
+  media_backend: "no_media"           # "no_media" = our app handles camera/audio
+  wake_on_start: true                 # call wake_up() on fresh daemon start
+  sleep_on_exit: false                # call goto_sleep() on exit (blocks ~2s)
+  antenna_rest_position: [0.0, 0.0]   # antenna target after wake-up
+  daemon_retry_attempts: 3            # connection retries
+  daemon_startup_wait: 15.0           # seconds to wait before retry
 
 rag:
   enabled: true

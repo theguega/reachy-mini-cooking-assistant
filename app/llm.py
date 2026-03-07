@@ -52,21 +52,30 @@ class LLM:
             print(f"LLM connection error: {e}")
             return False
 
-    def _messages(self, prompt: str, system_prompt: Optional[str] = None) -> list:
-        msgs = []
-        sp = system_prompt or self.system_prompt
-        if sp:
-            msgs.append({"role": "system", "content": sp})
-        msgs.append({"role": "user", "content": prompt})
-        return msgs
-
-    def _messages_multimodal(
-        self, prompt: str, images_b64: list[str], system_prompt: Optional[str] = None,
+    def _messages(
+        self, prompt: str, system_prompt: Optional[str] = None,
+        few_shot: Optional[list[dict]] = None,
     ) -> list:
         msgs = []
         sp = system_prompt or self.system_prompt
         if sp:
             msgs.append({"role": "system", "content": sp})
+        if few_shot:
+            msgs.extend(few_shot)
+        msgs.append({"role": "user", "content": prompt})
+        return msgs
+
+    def _messages_multimodal(
+        self, prompt: str, images_b64: list[str],
+        system_prompt: Optional[str] = None,
+        few_shot: Optional[list[dict]] = None,
+    ) -> list:
+        msgs = []
+        sp = system_prompt or self.system_prompt
+        if sp:
+            msgs.append({"role": "system", "content": sp})
+        if few_shot:
+            msgs.extend(few_shot)
         content: list[dict] = [{"type": "text", "text": prompt}]
         for b64 in images_b64:
             content.append({
@@ -83,6 +92,7 @@ class LLM:
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         images_b64: Optional[list[str]] = None,
+        few_shot: Optional[list[dict]] = None,
     ) -> Iterator[tuple]:
         """Yields (content, metadata) tuples. Pass images_b64 for multimodal VLM requests."""
         if not self._loaded:
@@ -91,9 +101,9 @@ class LLM:
         mt = max_tokens or self.max_tokens
         t = temperature if temperature is not None else self.temperature
         if images_b64:
-            msgs = self._messages_multimodal(prompt, images_b64, system_prompt)
+            msgs = self._messages_multimodal(prompt, images_b64, system_prompt, few_shot)
         else:
-            msgs = self._messages(prompt, system_prompt)
+            msgs = self._messages(prompt, system_prompt, few_shot)
 
         if self.backend == "openai":
             yield from self._stream_openai(msgs, mt, t)

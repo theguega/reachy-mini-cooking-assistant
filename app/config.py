@@ -2,7 +2,7 @@
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 import yaml
 
@@ -35,13 +35,28 @@ class TTSConfig:
     speed: float = 1.0
     piper_voice: str = "en_US-lessac-medium"
     lang: str = "en-us"
+    first_chunk_words: int = 3
+    max_chunk_words: int = 8
 
 
 @dataclass
 class AudioConfig:
     sample_rate: int = 16000
     channels: int = 2
-    input_device: Optional[str] = "EMEET"
+    input_device: Optional[str] = "Reachy Mini Audio"
+
+
+@dataclass
+class VADConfig:
+    speech_threshold: float = 0.008
+    silence_duration_ms: int = 500
+    lookback_ms: int = 250
+    max_speech_secs: int = 15
+    chunk_ms: int = 30
+    min_utterance_secs: float = 0.3
+    min_utterance_rms: float = 0.005
+    use_silero: bool = False
+    silero_threshold: float = 0.5
 
 
 @dataclass
@@ -54,11 +69,22 @@ class VisionConfig:
     capture_fps: float = 3.0
     system_prompt: str = (
         "You are a vision assistant on an NVIDIA Jetson device with a live camera. "
-        "You receive sequential frames captured while the user was speaking, ordered earliest to latest. "
-        "Use differences between frames to understand motion, gestures, and actions. "
-        "Answer in one to two sentences. Be direct and concise. "
-        "Never use emojis, asterisks, bullet points, markdown, or special formatting."
+        "Answer in one to two sentences. Be direct and concise."
     )
+    few_shot: List[Dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class ReachyConfig:
+    enabled: bool = True
+    spawn_daemon: bool = True
+    timeout: float = 30.0
+    media_backend: str = "no_media"
+    wake_on_start: bool = True
+    sleep_on_exit: bool = False
+    antenna_rest_position: List[float] = field(default_factory=lambda: [0.0, 0.0])
+    daemon_retry_attempts: int = 3
+    daemon_startup_wait: float = 15.0
 
 
 @dataclass
@@ -75,14 +101,28 @@ class RAGConfig:
     chunk_overlap: int = 20
 
 
+_SECTIONS = [
+    ("llm", "llm", LLMConfig),
+    ("stt", "stt", STTConfig),
+    ("tts", "tts", TTSConfig),
+    ("audio", "audio", AudioConfig),
+    ("vad", "vad", VADConfig),
+    ("vision", "vision", VisionConfig),
+    ("reachy", "reachy", ReachyConfig),
+    ("rag", "rag", RAGConfig),
+]
+
+
 @dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     stt: STTConfig = field(default_factory=STTConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
-    rag: RAGConfig = field(default_factory=RAGConfig)
+    vad: VADConfig = field(default_factory=VADConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
+    reachy: ReachyConfig = field(default_factory=ReachyConfig)
+    rag: RAGConfig = field(default_factory=RAGConfig)
 
     @classmethod
     def load(cls, config_path: Optional[str] = None) -> "Config":
@@ -94,11 +134,9 @@ class Config:
         try:
             with open(config_path) as f:
                 data = yaml.safe_load(f) or {}
-            for section_name, section_obj in [
-                ("llm", config.llm), ("stt", config.stt), ("tts", config.tts),
-                ("audio", config.audio), ("rag", config.rag), ("vision", config.vision),
-            ]:
-                for k, v in data.get(section_name, {}).items():
+            for yaml_key, attr_name, _ in _SECTIONS:
+                section_obj = getattr(config, attr_name)
+                for k, v in data.get(yaml_key, {}).items():
                     if hasattr(section_obj, k):
                         setattr(section_obj, k, v)
         except Exception as e:
