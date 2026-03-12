@@ -258,15 +258,19 @@ See [SETUP.md](SETUP.md#troubleshooting) for common issues and fixes.
 
 ## License Notes
 
-This project (MIT) uses [Kokoro ONNX](https://github.com/thewh1teagle/kokoro-onnx) for text-to-speech. Kokoro ONNX itself is MIT-licensed, but it depends on:
+This project uses [Kokoro ONNX](https://github.com/thewh1teagle/kokoro-onnx) for text-to-speech. Kokoro ONNX itself is MIT-licensed, but it depends on:
 
 - **phonemizer-fork** — GPL-3.0 (text-to-phoneme conversion)
 - **espeak-ng** — GPL-3.0 (speech synthesis library loaded by `espeakng-loader`)
 
 To avoid loading GPL-licensed code into the same process as NVIDIA CUDA libraries, TTS runs in a **separate subprocess** (`app/tts_worker.py`). The main application process never imports `kokoro-onnx`, `phonemizer-fork`, or `espeak-ng` — it communicates with the TTS worker via JSON over stdin/stdout. This is the same process-boundary isolation pattern used by the `llama.cpp` VLM backend (which runs in a separate Docker container).
 
-All other dependencies use permissive licenses (MIT, BSD-3, Apache-2.0).
+All other dependencies use permissive licenses (MIT, BSD-3, Apache-2.0). See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the full list.
+
+## Contributing
+
+We welcome community contributions. Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines, including the Developer Certificate of Origin (DCO) sign-off requirement.
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+Apache 2.0 — see [LICENSE](LICENSE) for details.
