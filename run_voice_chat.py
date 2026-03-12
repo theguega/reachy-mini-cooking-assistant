@@ -78,9 +78,7 @@ def main():
     console.print(f"  ✓ LLM ({llm.model})")
 
     tts = create_tts(
-        backend=config.tts.backend, voice=config.tts.voice,
-        speed=config.tts.speed, piper_voice=config.tts.piper_voice,
-        lang=config.tts.lang,
+        voice=config.tts.voice, speed=config.tts.speed, lang=config.tts.lang,
     )
     tts = tts if tts.load() else None
     if tts:

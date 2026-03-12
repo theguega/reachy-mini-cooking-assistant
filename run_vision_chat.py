@@ -26,6 +26,8 @@ from app.pipeline import (
     SAMPLE_RATE, MicRecorder, warmup_stt, vad_loop, stream_and_speak, load_silero,
 )
 from app.reachy import kill_stale_camera_holders, connect as connect_reachy
+from app.emotion import EmotionDetector
+from app.movements import MovementController
 from rich.console import Console
 from rich.panel import Panel
 
@@ -148,15 +150,26 @@ def main():
     console.print(f"  ✓ VLM ({llm.model})")
 
     tts = create_tts(
-        backend=config.tts.backend, voice=config.tts.voice,
-        speed=config.tts.speed, piper_voice=config.tts.piper_voice,
-        lang=config.tts.lang,
+        voice=config.tts.voice, speed=config.tts.speed, lang=config.tts.lang,
     )
     tts = tts if tts.load() else None
     if tts:
         console.print(f"  ✓ TTS ({tts.backend_name}, {tts.voice})")
     else:
         console.print("  ⚠ TTS unavailable")
+
+    emotion_detector = None
+    mover = None
+    if config.emotion.enabled:
+        emotion_detector = EmotionDetector()
+        if emotion_detector.load():
+            console.print("  ✓ Emotion (distilbert-sst2, CPU)")
+            if reachy:
+                mover = MovementController(reachy, config.reachy.antenna_rest_position)
+                console.print("  ✓ Emotion movements enabled")
+        else:
+            console.print("  ⚠ Emotion detector unavailable")
+            emotion_detector = None
 
     # ── Start mic ────────────────────────────────────────────────
     effective_chunk_ms = 32 if silero_model else config.vad.chunk_ms
@@ -205,6 +218,15 @@ def main():
                 mic.resume()
                 continue
 
+            emotion_tag = ""
+            if emotion_detector:
+                emo = emotion_detector.detect(text)
+                moved = mover.react(emo.emotion, emo.confidence) if mover else False
+                emotion_tag = (
+                    f" | {emo.emotion.value} ({emo.confidence:.0%}, {emo.inference_ms:.0f}ms)"
+                    f"{'*' if moved else ''}"
+                )
+
             n_imgs = len(captured_frames)
             console.print(
                 f'  [green]You:[/green] "{text}" '
@@ -229,6 +251,7 @@ def main():
                 timing += f" | TTFT {ttft:.1f}s | VLM {dt_llm:.1f}s ~{toks/(dt_llm or 1):.0f}w/s"
             else:
                 timing += " | VLM no response"
+            timing += emotion_tag
             timing += "[/dim]"
             console.print(timing)
 
@@ -240,6 +263,8 @@ def main():
         pass
 
     _do_cleanup()
+    if mover:
+        mover.reset()
     try:
         if stt:
             stt.unload()
@@ -247,6 +272,8 @@ def main():
             llm.unload()
         if tts:
             tts.unload()
+        if emotion_detector:
+            emotion_detector.unload()
     except Exception:
         pass
     console.print("[yellow]Goodbye![/yellow]")

@@ -30,10 +30,8 @@ class STTConfig:
 
 @dataclass
 class TTSConfig:
-    backend: str = "kokoro"
     voice: str = "af_sarah"
     speed: float = 1.0
-    piper_voice: str = "en_US-lessac-medium"
     lang: str = "en-us"
     first_chunk_words: int = 3
     max_chunk_words: int = 8
@@ -88,6 +86,11 @@ class ReachyConfig:
 
 
 @dataclass
+class EmotionConfig:
+    enabled: bool = True
+
+
+@dataclass
 class RAGConfig:
     enabled: bool = True
     knowledge_dir: str = "./knowledge_base"
@@ -116,6 +119,7 @@ _SECTIONS = [
     ("vad", "vad", VADConfig),
     ("vision", "vision", VisionConfig),
     ("reachy", "reachy", ReachyConfig),
+    ("emotion", "emotion", EmotionConfig),
     ("rag", "rag", RAGConfig),
     ("web", "web", WebConfig),
 ]
@@ -130,6 +134,7 @@ class Config:
     vad: VADConfig = field(default_factory=VADConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
     reachy: ReachyConfig = field(default_factory=ReachyConfig)
+    emotion: EmotionConfig = field(default_factory=EmotionConfig)
     rag: RAGConfig = field(default_factory=RAGConfig)
     web: WebConfig = field(default_factory=WebConfig)
 

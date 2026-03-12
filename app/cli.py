@@ -162,7 +162,7 @@ def info():
                     console.print(f"[green]✓ Ollama[/green]: {', '.join(names[:3])}")
     except Exception:
         console.print(f"[red]✗ LLM not running at {config.llm.base_url}[/red]")
-    for lib, name in [("faster_whisper", "faster-whisper"), ("piper", "piper-tts"), ("chromadb", "ChromaDB")]:
+    for lib, name in [("faster_whisper", "faster-whisper"), ("kokoro_onnx", "kokoro-onnx"), ("chromadb", "ChromaDB")]:
         try:
             __import__(lib)
             console.print(f"[green]✓ {name}[/green]")

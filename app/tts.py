@@ -1,21 +1,32 @@
-"""TTS — pluggable text-to-speech backends (Piper and Kokoro)."""
+# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: MIT
+#
+# TTS — subprocess-isolated Kokoro TTS.
+#
+# kokoro-onnx depends on phonemizer-fork (GPL-3.0) and espeak-ng (GPL-3.0).
+# To avoid loading GPL code into the same process as NVIDIA CUDA libraries,
+# synthesis runs in a separate subprocess (app/tts_worker.py) that
+# communicates via JSON lines over stdin/stdout.
 
 import sys
+import json
 import wave
-from typing import Dict, Any
+import base64
+import subprocess
+from typing import Dict, Any, Optional
 from pathlib import Path
+
 import numpy as np
 
 
 VOICES_DIR = Path(__file__).resolve().parent.parent / "voices"
 
-# Kokoro v1.0 model files (auto-downloaded if missing)
 KOKORO_MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
 KOKORO_VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
 
 
 def _download_kokoro_models_if_missing() -> bool:
-    """Download Kokoro model and voices to voices/ if not present. Returns True if both files exist (after optional download)."""
+    """Download Kokoro model and voices to voices/ if not present."""
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
     model_path = VOICES_DIR / "kokoro-v1.0.onnx"
     voices_path = VOICES_DIR / "voices-v1.0.bin"
@@ -55,136 +66,93 @@ def _download_kokoro_models_if_missing() -> bool:
     return True
 
 
-class PiperTTS:
-    """Piper neural TTS (CPU, lightweight, ~61 MB model)."""
-
-    def __init__(self, voice: str = "en_US-lessac-medium", speed: float = 1.0):
-        self.voice = voice
-        self.speed = speed
-        self._piper = None
-        self._sample_rate = 22050
-        self.backend_name = "Piper"
-
-    def load(self) -> bool:
-        try:
-            from piper import PiperVoice
-
-            search = [
-                VOICES_DIR / f"{self.voice}.onnx",
-                Path(self.voice),
-                Path(f"{self.voice}.onnx"),
-                Path.home() / ".local" / "share" / "piper" / "voices" / f"{self.voice}.onnx",
-            ]
-            for p in search:
-                try:
-                    if p.exists():
-                        cfg = p.with_suffix(".json")
-                        self._piper = PiperVoice.load(str(p), config_path=str(cfg) if cfg.exists() else None)
-                        if hasattr(self._piper, "config") and self._piper.config:
-                            self._sample_rate = getattr(self._piper.config, "sample_rate", 22050)
-                        return True
-                except Exception:
-                    continue
-            print(f"TTS voice not found: {self.voice}")
-            return False
-        except ImportError:
-            print("piper-tts not installed")
-            return False
-
-    def synthesize(self, text: str) -> Dict[str, Any]:
-        if self._piper is None:
-            return {"audio": None, "error": "Not loaded"}
-        if not text.strip():
-            return {"audio": None, "error": "Empty"}
-        try:
-            chunks = []
-            for chunk in self._piper.synthesize(text):
-                chunks.append((chunk.audio_float_array * 32767).astype(np.int16))
-            if not chunks:
-                return {"audio": None, "error": "No audio"}
-            return {"audio": np.concatenate(chunks), "sample_rate": self._sample_rate}
-        except Exception as e:
-            return {"audio": None, "error": str(e)}
-
-    def synthesize_to_file(self, text: str, path: str) -> bool:
-        r = self.synthesize(text)
-        if r.get("audio") is None:
-            return False
-        with wave.open(path, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(self._sample_rate)
-            wf.writeframes(r["audio"].tobytes())
-        return True
-
-    def health_check(self) -> bool:
-        return self._piper is not None
-
-    def unload(self):
-        if self._piper:
-            del self._piper
-            self._piper = None
-
-
 class KokoroTTS:
-    """Kokoro neural TTS (ONNX Runtime, high quality, ~300 MB model)."""
+    """Kokoro TTS client — synthesis runs in a subprocess for GPL isolation."""
 
     def __init__(self, voice: str = "af_sarah", speed: float = 1.0, lang: str = "en-us"):
         self.voice = voice
         self.speed = speed
         self.lang = lang
-        self._kokoro = None
+        self._proc: Optional[subprocess.Popen] = None
         self._sample_rate = 24000
         self.backend_name = "Kokoro"
+        self.provider = "unknown"
 
     def load(self) -> bool:
-        try:
-            import os
-            import onnxruntime as ort
-
-            model_path = VOICES_DIR / "kokoro-v1.0.onnx"
-            voices_path = VOICES_DIR / "voices-v1.0.bin"
-
-            if not model_path.exists() or not voices_path.exists():
-                if not _download_kokoro_models_if_missing():
-                    return False
-                model_path = VOICES_DIR / "kokoro-v1.0.onnx"
-                voices_path = VOICES_DIR / "voices-v1.0.bin"
-            if not model_path.exists() or not voices_path.exists():
+        model_path = VOICES_DIR / "kokoro-v1.0.onnx"
+        voices_path = VOICES_DIR / "voices-v1.0.bin"
+        if not model_path.exists() or not voices_path.exists():
+            if not _download_kokoro_models_if_missing():
                 return False
 
-            available = ort.get_available_providers()
-            if "CUDAExecutionProvider" in available:
-                os.environ["ONNX_PROVIDER"] = "CUDAExecutionProvider"
-            elif "TensorrtExecutionProvider" in available:
-                os.environ["ONNX_PROVIDER"] = "TensorrtExecutionProvider"
-
-            from kokoro_onnx import Kokoro
-            self._kokoro = Kokoro(str(model_path), str(voices_path))
-
-            provider_used = self._kokoro.sess.get_providers()[0]
-            print(f"Kokoro TTS loaded — ONNX provider: {provider_used}")
-            return True
-        except ImportError:
-            print("kokoro-onnx not installed (pip install kokoro-onnx)")
-            return False
+        worker = Path(__file__).parent / "tts_worker.py"
+        try:
+            self._proc = subprocess.Popen(
+                [sys.executable, str(worker),
+                 "--model-dir", str(VOICES_DIR),
+                 "--voice", self.voice,
+                 "--speed", str(self.speed),
+                 "--lang", self.lang],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=None,  # inherit parent's stderr for log visibility
+                text=True,
+                bufsize=1,
+            )
         except Exception as e:
-            print(f"Kokoro load error: {e}")
+            print(f"TTS worker spawn failed: {e}")
             return False
+
+        line = self._proc.stdout.readline()
+        if not line:
+            print("TTS worker exited before signalling ready")
+            return False
+
+        try:
+            resp = json.loads(line)
+        except json.JSONDecodeError:
+            print(f"TTS worker sent invalid init response: {line!r}")
+            return False
+
+        if resp.get("status") == "ready":
+            self.provider = resp.get("provider", "unknown")
+            return True
+
+        print(f"TTS worker error: {resp.get('error', 'unknown')}")
+        return False
+
+    def _send(self, req: dict) -> Optional[dict]:
+        if not self._proc or self._proc.poll() is not None:
+            return None
+        try:
+            self._proc.stdin.write(json.dumps(req) + "\n")
+            self._proc.stdin.flush()
+            line = self._proc.stdout.readline()
+            if not line:
+                return None
+            return json.loads(line)
+        except (BrokenPipeError, json.JSONDecodeError, OSError):
+            return None
 
     def synthesize(self, text: str) -> Dict[str, Any]:
-        if self._kokoro is None:
-            return {"audio": None, "error": "Not loaded"}
         if not text.strip():
             return {"audio": None, "error": "Empty"}
-        try:
-            samples, sample_rate = self._kokoro.create(
-                text, voice=self.voice, speed=self.speed, lang=self.lang,
-            )
-            audio_int16 = (samples * 32767).astype(np.int16)
-            return {"audio": audio_int16, "sample_rate": sample_rate}
-        except Exception as e:
-            return {"audio": None, "error": str(e)}
+
+        resp = self._send({
+            "cmd": "synthesize",
+            "text": text,
+            "voice": self.voice,
+            "speed": self.speed,
+            "lang": self.lang,
+        })
+        if resp is None:
+            return {"audio": None, "error": "Worker not running"}
+        if "error" in resp:
+            return {"audio": None, "error": resp["error"]}
+
+        audio_bytes = base64.b64decode(resp["audio_b64"])
+        audio = np.frombuffer(audio_bytes, dtype=np.int16)
+        return {"audio": audio, "sample_rate": resp["sample_rate"]}
 
     def synthesize_to_file(self, text: str, path: str) -> bool:
         r = self.synthesize(text)
@@ -198,26 +166,21 @@ class KokoroTTS:
         return True
 
     def health_check(self) -> bool:
-        return self._kokoro is not None
+        resp = self._send({"cmd": "health"})
+        return resp is not None and resp.get("healthy", False)
 
     def unload(self):
-        if self._kokoro:
-            del self._kokoro
-            self._kokoro = None
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.stdin.write(json.dumps({"cmd": "shutdown"}) + "\n")
+                self._proc.stdin.flush()
+                self._proc.wait(timeout=5)
+            except Exception:
+                self._proc.kill()
+            self._proc = None
 
 
-def create_tts(backend: str = "piper", voice: str = "", speed: float = 1.0,
-               piper_voice: str = "en_US-lessac-medium", lang: str = "en-us"):
-    """Factory: create the right TTS backend. Falls back to Piper if Kokoro model is missing."""
-    if backend == "kokoro":
-        k = KokoroTTS(voice=voice or "af_sarah", speed=speed, lang=lang)
-        if k.load():
-            return k
-        print(
-            "Kokoro model not found (download kokoro-v1.0.onnx and voices-v1.0.bin to voices/). "
-            "Falling back to Piper."
-        )
-        p = PiperTTS(voice=piper_voice, speed=speed)
-        p.load()
-        return p
-    return PiperTTS(voice=voice or piper_voice, speed=speed)
+def create_tts(voice: str = "", speed: float = 1.0, lang: str = "en-us",
+               **_kwargs):
+    """Create the TTS backend (Kokoro, subprocess-isolated)."""
+    return KokoroTTS(voice=voice or "af_sarah", speed=speed, lang=lang)
