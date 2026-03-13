@@ -24,9 +24,11 @@ Speak to Reachy Mini and it responds using a vision-language model that sees thr
 
 ## Demo
 
-| Terminal | Web UI |
-|----------|--------|
-| Real-time STT, VLM streaming, timing stats | Live camera feed, conversation log, system monitor |
+<p align="center">
+  <img src="docs/images/reachy-mini-jetson.png" alt="Reachy Mini Jetson Assistant — Web UI" width="100%"/>
+</p>
+
+ 
 
 ## Supported Modes
 
