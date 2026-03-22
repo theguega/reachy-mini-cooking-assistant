@@ -125,9 +125,21 @@ def find_pa_sink(name_hint: str) -> Optional[str]:
 
 def play_audio(audio: np.ndarray, sample_rate: int, sink: Optional[str] = None):
     """Play int16 audio via paplay/aplay or sounddevice fallback."""
-    raw = audio.astype(np.int16).tobytes()
+    if audio is None or len(audio) == 0:
+        return
+
+    # Normalize/Boost volume (ensure it uses the full 16-bit range)
+    audio = audio.astype(np.float32)
+    max_val = np.abs(audio).max()
+    if max_val > 0:
+        audio = (audio / max_val) * 32767.0
+    audio = audio.astype(np.int16)
     
-    # Try paplay
+    raw = audio.tobytes()
+    sys.stdout.write(f"  [Speaker] Playing {len(audio)/sample_rate:.1f}s audio...    \r")
+    sys.stdout.flush()
+    
+    # Try paplay (PulseAudio)
     if sink:
         try:
             cmd = ["paplay", f"--device={sink}", "--format=s16le",
@@ -140,12 +152,13 @@ def play_audio(audio: np.ndarray, sample_rate: int, sink: Optional[str] = None):
         except Exception:
             pass
             
-    # Try aplay
+    # Try aplay (ALSA)
     try:
         from shutil import which
         if which("aplay"):
             cmd = ["aplay", "-f", "S16_LE", "-r", str(sample_rate),
                    "-c", "1", "-t", "raw", "-q"]
+            # If we know the card, we could add -D hw:X,Y here
             p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
             p.stdin.write(raw)
             p.stdin.close()
@@ -154,13 +167,14 @@ def play_audio(audio: np.ndarray, sample_rate: int, sink: Optional[str] = None):
     except Exception:
         pass
 
-    # Fallback to sounddevice
+    # Fallback to sounddevice (macOS / Generic)
     try:
         import sounddevice as sd
-        sd.play(audio, sample_rate)
+        # Use explicit float32 for sounddevice as it's often more reliable
+        sd.play(audio.astype(np.float32) / 32768.0, sample_rate)
         sd.wait()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"\n[Playback Error] {e}")
 
 
 def tts_player(tts_obj, tts_q: queue.Queue, sink: Optional[str] = None):
