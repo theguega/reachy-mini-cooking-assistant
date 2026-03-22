@@ -369,16 +369,24 @@ def vad_loop(
     while mic.alive:
         try:
             raw = mic.audio_q.get(timeout=0.1)
-        except queue.Empty:
+        except queue.Queue.Empty:
             continue
 
         rms = chunk_rms(raw)
+        prob = silero(raw) if use_silero else 0.0
+
+        # LIVE METER: Show current levels even when not speaking
+        if not is_speaking:
+            meter = "█" * int(rms * 500)
+            sys.stdout.write(f"  Level: [{meter:<20}] rms={rms:.4f} prob={prob:.2f}    \r")
+            sys.stdout.flush()
 
         if use_silero:
-            if rms < rms_silence_floor:
+            # Re-enable energy pre-filter but keep it very low
+            if rms < 0.001: 
                 is_speech = False
             else:
-                is_speech = silero(raw) > silero_thresh
+                is_speech = prob > silero_thresh
         else:
             is_speech = rms > cfg.speech_threshold
 
@@ -388,8 +396,11 @@ def vad_loop(
                 is_speaking = True
                 speech_start_t = time.monotonic()
                 speech_raw = list(lookback)
-                sys.stdout.write("  🎤 Listening...\r")
-                sys.stdout.flush()
+            
+            # Debug: Show volume and speech probability
+            sys.stdout.write(f"  🎤 Listening... [rms={rms:.4f} prob={prob:.2f}]        \r")
+            sys.stdout.flush()
+            
             speech_raw.append(raw)
             if len(speech_raw) < max_chunks:
                 continue
@@ -397,6 +408,11 @@ def vad_loop(
             if is_speaking:
                 speech_raw.append(raw)
                 silence_count += 1
+                
+                # Show silence countdown
+                sys.stdout.write(f"  🎤 Listening... [silence {silence_count}/{silence_chunks}]    \r")
+                sys.stdout.flush()
+                
                 if silence_count < silence_chunks:
                     continue
             else:
@@ -416,11 +432,12 @@ def vad_loop(
         dur_s = len(captured) * chunk_ms / 1000
         cap_rms = chunk_rms(b"".join(captured))
 
-        sys.stdout.write("                              \r")
+        sys.stdout.write("                                                                \r")
         sys.stdout.flush()
         mic.pause()
 
-        if dur_s < cfg.min_utterance_secs or cap_rms < cfg.min_utterance_rms:
+        # EXTREMELY LENIENT: Only reject if it's virtually silent or way too short
+        if dur_s < 0.2 or cap_rms < 0.001:
             console.print(f"[dim]  (noise: {dur_s:.1f}s, rms={cap_rms:.4f})[/dim]")
             mic.resume()
             continue
