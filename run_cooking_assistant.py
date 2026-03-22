@@ -208,13 +208,43 @@ def main():
 
     console.print("\n[bold green]Ready to cook![/bold green] Just speak to Reachy.\n")
 
-    # ── Proactive Vision Thread ───────────────────────────────────
-    # We broadcast frames to the web UI frequently
+    # Flag to prevent background overseer from talking during user conversation
+    is_busy = threading.Lock()
+
+    # ── Proactive Vision / Overseer Thread ─────────────────────────
+    # We broadcast frames to the web UI AND periodically check for mistakes
     def _vision_broadcaster():
+        last_check = time.time()
         while True:
             frame = cam.get_latest_frame()
             if frame:
                 broadcaster.send({"type": "image", "data": frame})
+
+            # Check every 20 seconds if we are not in the middle of a speech
+            if time.time() - last_check > 20 and not is_busy.locked():
+                last_check = time.time()
+                if frame and llm and tts:
+                    console.print("[dim]  (Proactive Vision Check...)[/dim]")
+                    proactive_prompt = (
+                        "Look at the kitchen. Am I doing anything wrong or is there any cooking advice "
+                        "you can offer right now? If everything is fine, say EXACTLY: 'All good'. "
+                        "Otherwise, give a very short tip."
+                    )
+                    # We use generate_stream but only take the full response
+                    resp = ""
+                    for chunk, _ in llm.generate_stream(proactive_prompt, images_b64=[frame]):
+                        resp += chunk
+
+                    if resp.strip() and "all good" not in resp.lower() and not is_busy.locked():
+                        console.print(f"  [magenta]Overseer:[/magenta] {resp}")
+                        broadcaster.send({"type": "chat", "role": "assistant", "text": f"(Overseer) {resp}"})
+                        tts.synthesize_to_file(resp, "/tmp/overseer.wav")
+                        # Simple play fallback
+                        from app.pipeline import play_audio
+                        r = tts.synthesize(resp)
+                        if r.get("audio") is not None:
+                            play_audio(r["audio"], r["sample_rate"])
+
             time.sleep(1.0 / config.web.ui_fps)
 
     threading.Thread(target=_vision_broadcaster, daemon=True).start()
@@ -222,81 +252,90 @@ def main():
     # ── Main Loop ────────────────────────────────────────────────
     try:
         for segment in vad_loop(mic, console, vad_cfg=config.vad, silero=silero_model):
-            # Capture what Reachy was seeing DURING the speech
-            captured_frames = cam.get_speech_frames(
-                speech_start=segment.start_time,
-                speech_end=segment.end_time,
-                max_frames=config.vision.frames,
-            )
+            # Tell the overseer to be quiet while we talk
+            with is_busy:
+                # Capture what Reachy was seeing DURING the speech
+                captured_frames = cam.get_speech_frames(
+                    speech_start=segment.start_time,
+                    speech_end=segment.end_time,
+                    max_frames=config.vision.frames,
+                )
 
-            # Transcribe
-            console.print(f"  [cyan]●[/cyan] Transcribing {segment.duration:.1f}s audio...")
-            result = stt.transcribe(segment.audio, sample_rate=SAMPLE_RATE)
-            text = result.get("text", "").strip()
-            err = result.get("error", "")
+                # Transcribe
+                console.print(f"  [cyan]●[/cyan] Transcribing {segment.duration:.1f}s audio...")
+                result = stt.transcribe(segment.audio, sample_rate=SAMPLE_RATE)
+                text = result.get("text", "").strip()
+                err = result.get("error", "")
 
-            if not text:
-                if err:
-                    console.print(f"  [red]  (STT Error: {err})[/red]")
-                else:
-                    console.print("  [dim]  (STT: no text returned)[/dim]")
-                mic.resume()
-                continue
+                if not text:
+                    if err:
+                        console.print(f"  [red]  (STT Error: {err})[/red]")
+                    else:
+                        console.print("  [dim]  (STT: no text returned)[/dim]")
+                    mic.resume()
+                    continue
 
-            console.print(f'  [green]You:[/green] "{text}"')
-            broadcaster.send({"type": "chat", "role": "user", "text": text})
+                console.print(f'  [green]You:[/green] "{text}"')
+                broadcaster.send({"type": "chat", "role": "user", "text": text})
 
-            # Memory storage check
-            mem_response = handle_memory_storage(kb, text)
-            if mem_response:
-                console.print(f"  [magenta]Assistant:[/magenta] {mem_response}")
-                broadcaster.send({"type": "chat", "role": "assistant", "text": mem_response})
-                if tts: tts.synthesize_to_file(mem_response, "/tmp/resp.wav")
-                mic.resume()
-                continue
+                # Memory storage check
+                mem_response = handle_memory_storage(kb, text)
+                if mem_response:
+                    console.print(f"  [magenta]Assistant:[/magenta] {mem_response}")
+                    broadcaster.send({"type": "chat", "role": "assistant", "text": mem_response})
+                    if tts: 
+                        r = tts.synthesize(mem_response)
+                        if r.get("audio") is not None:
+                            from app.pipeline import play_audio
+                            play_audio(r["audio"], r["sample_rate"])
+                    mic.resume()
+                    continue
 
-            # Agentic tasks check
-            timer_response = handle_timers(text)
-            if timer_response:
-                console.print(f"  [magenta]Assistant:[/magenta] {timer_response}")
-                broadcaster.send({"type": "chat", "role": "assistant", "text": timer_response})
-                if tts: tts.synthesize_to_file(timer_response, "/tmp/resp.wav")
-                mic.resume()
-                continue
+                # Agentic tasks check
+                timer_response = handle_timers(text)
+                if timer_response:
+                    console.print(f"  [magenta]Assistant:[/magenta] {timer_response}")
+                    broadcaster.send({"type": "chat", "role": "assistant", "text": timer_response})
+                    if tts: 
+                        r = tts.synthesize(timer_response)
+                        if r.get("audio") is not None:
+                            from app.pipeline import play_audio
+                            play_audio(r["audio"], r["sample_rate"])
+                    mic.resume()
+                    continue
 
-            # Sign Language trigger
-            if config.cooking.sign_language_enabled and ("sign" in text.lower() or "show me" in text.lower()):
-                sign_with_antennas(mover, text)
+                # Sign Language trigger
+                if config.cooking.sign_language_enabled and ("sign" in text.lower() or "show me" in text.lower()):
+                    sign_with_antennas(mover, text)
 
-            # RAG Retrieval
-            prompt_text = text
-            if config.rag.enabled:
-                prompt_text = retriever.augment_query(text)
+                # RAG Retrieval
+                prompt_text = text
+                if config.rag.enabled:
+                    prompt_text = retriever.augment_query(text)
 
-            # LLM Stream
-            n_imgs = len(captured_frames)
-            console.print(f"  [cyan]●[/cyan] Calling {config.llm.model} (VLM with {n_imgs} frames)...")
-            console.print("  [magenta]Assistant:[/magenta] ", end="")
-            sys.stdout.flush()
+                # LLM Stream
+                n_imgs = len(captured_frames)
+                console.print(f"  [cyan]●[/cyan] Calling {config.llm.model} (VLM with {n_imgs} frames)...")
+                console.print("  [magenta]Assistant:[/magenta] ", end="")
+                sys.stdout.flush()
 
-            full_resp, dt_llm, ttft = stream_and_speak(
-                llm,
-                tts,
-                prompt_text,
-                config.cooking.system_prompt,
-                mic.pa_sink,
-                images_b64=captured_frames if captured_frames else None,
-            )
-            console.print()
-            broadcaster.send({"type": "chat", "role": "assistant", "text": full_resp})
+                full_resp, dt_llm, ttft = stream_and_speak(
+                    llm,
+                    tts,
+                    prompt_text,
+                    config.cooking.system_prompt,
+                    mic.pa_sink,
+                    images_b64=captured_frames if captured_frames else None,
+                )
+                console.print()
+                broadcaster.send({"type": "chat", "role": "assistant", "text": full_resp})
 
-            # Movement react
-            if emotion_detector and mover:
-                emo = emotion_detector.detect(full_resp)  # Detect assistant emotion
-                mover.react(emo.emotion, emo.confidence)
+                # Movement react
+                if emotion_detector and mover:
+                    emo = emotion_detector.detect(full_resp)  # Detect assistant emotion
+                    mover.react(emo.emotion, emo.confidence)
 
             mic.resume()
-
     except KeyboardInterrupt:
         pass
 
