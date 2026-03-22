@@ -233,9 +233,13 @@ def main():
             console.print(f"  [cyan]●[/cyan] Transcribing {segment.duration:.1f}s audio...")
             result = stt.transcribe(segment.audio, sample_rate=SAMPLE_RATE)
             text = result.get("text", "").strip()
+            err = result.get("error", "")
 
             if not text:
-                console.print("  [dim]  (STT: no text returned)[/dim]")
+                if err:
+                    console.print(f"  [red]  (STT Error: {err})[/red]")
+                else:
+                    console.print("  [dim]  (STT: no text returned)[/dim]")
                 mic.resume()
                 continue
 
