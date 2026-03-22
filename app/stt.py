@@ -145,7 +145,15 @@ class OpenAISTT:
 
 def STT(backend: str = "faster-whisper", **kwargs):
     if backend == "openai":
-        return OpenAISTT(api_key=kwargs.get("api_key", ""), model=kwargs.get("model", "whisper-1"), language=kwargs.get("language", "en"))
+        # OpenAI only supports "whisper-1". If the config has "base.en" or similar, override it.
+        model = kwargs.get("model", "whisper-1")
+        if not model or "." in model or model == "openai":
+            model = "whisper-1"
+        return OpenAISTT(
+            api_key=kwargs.get("api_key", ""),
+            model=model,
+            language=kwargs.get("language", "en"),
+        )
     return FasterWhisperSTT(
         model=kwargs.get("model", "base.en"),
         device=kwargs.get("device", "cuda"),
