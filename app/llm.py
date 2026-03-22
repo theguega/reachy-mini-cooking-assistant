@@ -24,6 +24,7 @@ class LLM:
     def __init__(
         self,
         model: str = "",
+        api_key: str = "",
         base_url: str = "http://localhost:8080",
         backend: str = "openai",
         max_tokens: int = 512,
@@ -32,6 +33,7 @@ class LLM:
         timeout: float = 120.0,
     ):
         self.model = model
+        self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.backend = (backend or "openai").lower()
         self.max_tokens = max_tokens
@@ -40,9 +42,15 @@ class LLM:
         self.timeout = timeout
         self._loaded = False
 
+    def _get_headers(self) -> Dict[str, str]:
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
     def load(self) -> bool:
         try:
-            with httpx.Client(timeout=10.0) as client:
+            with httpx.Client(timeout=10.0, headers=self._get_headers()) as client:
                 if self.backend == "openai":
                     r = client.get(f"{self.base_url}/v1/models")
                     if r.status_code != 200:
@@ -127,7 +135,7 @@ class LLM:
 
     def _stream_openai(self, messages, max_tokens, temperature) -> Iterator[tuple]:
         try:
-            with httpx.Client(timeout=self.timeout) as client:
+            with httpx.Client(timeout=self.timeout, headers=self._get_headers()) as client:
                 with client.stream("POST", f"{self.base_url}/v1/chat/completions", json={
                     "model": self.model, "messages": messages, "stream": True,
                     "max_tokens": max_tokens, "temperature": temperature,
@@ -161,7 +169,7 @@ class LLM:
 
     def _stream_ollama(self, messages, max_tokens, temperature) -> Iterator[tuple]:
         try:
-            with httpx.Client(timeout=self.timeout) as client:
+            with httpx.Client(timeout=self.timeout, headers=self._get_headers()) as client:
                 with client.stream("POST", f"{self.base_url}/api/chat", json={
                     "model": self.model, "messages": messages, "stream": True,
                     "keep_alive": "1h",
@@ -194,7 +202,7 @@ class LLM:
         if not self._loaded:
             return False
         try:
-            with httpx.Client(timeout=5.0) as client:
+            with httpx.Client(timeout=5.0, headers=self._get_headers()) as client:
                 url = f"{self.base_url}/v1/models" if self.backend == "openai" else f"{self.base_url}/api/tags"
                 return client.get(url).status_code == 200
         except Exception:

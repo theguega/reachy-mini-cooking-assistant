@@ -13,13 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""STT — faster-whisper, GPU-accelerated Whisper on Jetson."""
+"""STT — faster-whisper (local) or OpenAI Whisper API."""
 
-from typing import Dict, Any, Union
+import httpx
+import json
+import io
+import wave
+from typing import Dict, Any, Union, Optional
 import numpy as np
 
 
-class STT:
+class FasterWhisperSTT:
     def __init__(
         self,
         model: str = "base.en",
@@ -82,3 +86,70 @@ class STT:
         if self._model:
             del self._model
             self._model = None
+
+
+class OpenAISTT:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "whisper-1",
+        language: str = "en",
+        base_url: str = "https://api.openai.com/v1",
+    ):
+        self.api_key = api_key
+        self.model = model
+        self.language = language
+        self.base_url = base_url.rstrip("/")
+
+    def load(self) -> bool:
+        return bool(self.api_key)
+
+    def transcribe(self, audio: Union[np.ndarray, str], sample_rate: int = 16000) -> Dict[str, Any]:
+        try:
+            if isinstance(audio, np.ndarray):
+                buffer = io.BytesIO()
+                with wave.open(buffer, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sample_rate)
+                    # Convert float32 back to int16 if needed
+                    if audio.dtype == np.float32:
+                        audio = (audio * 32768.0).astype(np.int16)
+                    wf.writeframes(audio.tobytes())
+                buffer.seek(0)
+                file_data = ("audio.wav", buffer, "audio/wav")
+            else:
+                file_data = ("audio.wav", open(audio, "rb"), "audio/wav")
+
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            files = {"file": file_data}
+            data = {"model": self.model, "language": self.language}
+
+            with httpx.Client(timeout=60.0) as client:
+                r = client.post(f"{self.base_url}/audio/transcriptions", headers=headers, files=files, data=data)
+                if r.status_code != 200:
+                    return {"text": "", "error": f"OpenAI STT error {r.status_code}: {r.text}"}
+                return {"text": r.json().get("text", ""), "language": self.language}
+        except Exception as e:
+            return {"text": "", "error": str(e)}
+
+    def get_info(self) -> Dict[str, Any]:
+        return {"backend": "openai", "model": self.model}
+
+    def health_check(self) -> bool:
+        return True
+
+    def unload(self):
+        pass
+
+
+def STT(backend: str = "faster-whisper", **kwargs):
+    if backend == "openai":
+        return OpenAISTT(api_key=kwargs.get("api_key", ""), model=kwargs.get("model", "whisper-1"), language=kwargs.get("language", "en"))
+    return FasterWhisperSTT(
+        model=kwargs.get("model", "base.en"),
+        device=kwargs.get("device", "cuda"),
+        compute_type=kwargs.get("compute_type", "int8"),
+        language=kwargs.get("language", "en"),
+        beam_size=kwargs.get("beam_size", 1),
+    )

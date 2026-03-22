@@ -28,6 +28,7 @@ import numpy as np
 
 try:
     from scipy.spatial.transform import Rotation
+
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
@@ -82,8 +83,10 @@ class MovementController:
             return False
 
         now = time.time()
-        if (emotion == self._last_emotion
-                and (now - self._last_react_time) < self.COOLDOWN_SECS):
+        if (
+            emotion == self._last_emotion
+            and (now - self._last_react_time) < self.COOLDOWN_SECS
+        ):
             return False
 
         self._cancel.set()
@@ -98,6 +101,29 @@ class MovementController:
         )
         self._thread.start()
         return True
+
+    def perform_sign(self, sign_name: str) -> bool:
+        """Trigger a sign language movement sequence (non-blocking)."""
+        if self._reachy is None:
+            return False
+
+        self._cancel.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+
+        self._cancel.clear()
+        self._thread = threading.Thread(
+            target=self._run_sign_sequence, args=(sign_name,), daemon=True
+        )
+        self._thread.start()
+        return True
+
+    def _run_sign_sequence(self, sign_name: str) -> None:
+        try:
+            # For now, all signs use the same placeholder movement
+            _seq_sign_placeholder(self._reachy, self._cancel, self._antenna_rest)
+        except Exception:
+            pass
 
     def reset(self) -> None:
         """Return head and antennas to neutral position."""
@@ -215,6 +241,19 @@ def _seq_grateful(reachy, cancel: threading.Event, rest: list[float]) -> None:
     if _wait(cancel, 0.3):
         return
     reachy.goto_target(_head_pose(), duration=0.3)
+
+
+def _seq_sign_placeholder(reachy, cancel: threading.Event, rest: list[float]) -> None:
+    """A placeholder for sign language antenna movements."""
+    # Rotate antennas in a distinctive pattern
+    for _ in range(2):
+        reachy.set_target_antenna_joint_positions([1.0, 1.0])
+        if _wait(cancel, 0.4):
+            return
+        reachy.set_target_antenna_joint_positions([-1.0, -1.0])
+        if _wait(cancel, 0.4):
+            return
+    reachy.set_target_antenna_joint_positions(rest)
 
 
 def _seq_neutral(reachy, cancel: threading.Event, rest: list[float]) -> None:

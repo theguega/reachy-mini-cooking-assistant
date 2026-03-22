@@ -100,7 +100,9 @@ def create_app(broadcaster: Broadcaster) -> FastAPI:
 
     @app.get("/")
     async def _index():
-        path = STATIC_DIR / "index.html"
+        path = STATIC_DIR / "cooking.html"
+        if not path.exists():
+            path = STATIC_DIR / "index.html"
         if path.exists():
             return FileResponse(
                 path, media_type="text/html",

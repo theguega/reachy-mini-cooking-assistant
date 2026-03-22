@@ -25,6 +25,7 @@ import json
 import wave
 import base64
 import subprocess
+import httpx
 from typing import Dict, Any, Optional
 from pathlib import Path
 
@@ -192,7 +193,77 @@ class KokoroTTS:
             self._proc = None
 
 
-def create_tts(voice: str = "", speed: float = 1.0, lang: str = "en-us",
-               **_kwargs):
-    """Create the TTS backend (Kokoro, subprocess-isolated)."""
-    return KokoroTTS(voice=voice or "af_sarah", speed=speed, lang=lang)
+class OpenAITTS:
+    def __init__(
+        self,
+        api_key: str,
+        voice: str = "alloy",
+        model: str = "tts-1",
+        speed: float = 1.0,
+        base_url: str = "https://api.openai.com/v1",
+    ):
+        self.api_key = api_key
+        self.voice = voice
+        self.model = model
+        self.speed = speed
+        self.base_url = base_url.rstrip("/")
+        self.backend_name = "OpenAI"
+        self.provider = "openai"
+
+    def load(self) -> bool:
+        return bool(self.api_key)
+
+    def synthesize(self, text: str) -> Dict[str, Any]:
+        if not text.strip():
+            return {"audio": None, "error": "Empty"}
+        try:
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            data = {
+                "model": self.model,
+                "input": text,
+                "voice": self.voice,
+                "speed": self.speed,
+                "response_format": "pcm",
+            }
+            with httpx.Client(timeout=30.0) as client:
+                r = client.post(f"{self.base_url}/audio/speech", headers=headers, json=data)
+                if r.status_code != 200:
+                    return {"audio": None, "error": f"OpenAI TTS error {r.status_code}: {r.text}"}
+                
+                # OpenAI returns 24kHz PCM for response_format="pcm"
+                audio = np.frombuffer(r.content, dtype=np.int16)
+                return {"audio": audio, "sample_rate": 24000}
+        except Exception as e:
+            return {"audio": None, "error": str(e)}
+
+    def synthesize_to_file(self, text: str, path: str) -> bool:
+        r = self.synthesize(text)
+        if r.get("audio") is None:
+            return False
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(r["sample_rate"])
+            wf.writeframes(r["audio"].tobytes())
+        return True
+
+    def health_check(self) -> bool:
+        return True
+
+    def unload(self):
+        pass
+
+
+def create_tts(backend: str = "kokoro", **kwargs):
+    """Create the TTS backend (Kokoro or OpenAI)."""
+    if backend == "openai":
+        return OpenAITTS(
+            api_key=kwargs.get("api_key", ""),
+            voice=kwargs.get("voice", "alloy"),
+            speed=kwargs.get("speed", 1.0),
+        )
+    return KokoroTTS(
+        voice=kwargs.get("voice", "af_sarah"),
+        speed=kwargs.get("speed", 1.0),
+        lang=kwargs.get("lang", "en-us"),
+    )

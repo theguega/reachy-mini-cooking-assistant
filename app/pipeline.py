@@ -124,19 +124,41 @@ def find_pa_sink(name_hint: str) -> Optional[str]:
 
 
 def play_audio(audio: np.ndarray, sample_rate: int, sink: Optional[str] = None):
-    """Play int16 audio via paplay (PulseAudio) or aplay fallback."""
+    """Play int16 audio via paplay/aplay or sounddevice fallback."""
     raw = audio.astype(np.int16).tobytes()
-    try:
-        if sink:
+    
+    # Try paplay
+    if sink:
+        try:
             cmd = ["paplay", f"--device={sink}", "--format=s16le",
                    f"--rate={sample_rate}", "--channels=1", "--raw"]
-        else:
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            p.stdin.write(raw)
+            p.stdin.close()
+            p.wait(timeout=30)
+            return
+        except Exception:
+            pass
+            
+    # Try aplay
+    try:
+        from shutil import which
+        if which("aplay"):
             cmd = ["aplay", "-f", "S16_LE", "-r", str(sample_rate),
                    "-c", "1", "-t", "raw", "-q"]
-        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        p.stdin.write(raw)
-        p.stdin.close()
-        p.wait(timeout=30)
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            p.stdin.write(raw)
+            p.stdin.close()
+            p.wait(timeout=30)
+            return
+    except Exception:
+        pass
+
+    # Fallback to sounddevice
+    try:
+        import sounddevice as sd
+        sd.play(audio, sample_rate)
+        sd.wait()
     except Exception:
         pass
 
@@ -225,10 +247,7 @@ class MicRecorder:
 
     def start(self, hw: str, mic_hint: str) -> bool:
         """Start recording. Returns True on success."""
-        subprocess.run(["pkill", "-9", "parecord"], capture_output=True)
-        subprocess.run(["pkill", "-9", "arecord"], capture_output=True)
-        time.sleep(0.3)
-
+        # Try subprocess-based recording (PulseAudio/ALSA)
         self.pa_source = find_pa_source(mic_hint)
         self.pa_sink = find_pa_sink(mic_hint)
 
@@ -237,49 +256,45 @@ class MicRecorder:
             rec_cmd = ["parecord", "-d", self.pa_source, "--format=s16le",
                        f"--rate={SAMPLE_RATE}", f"--channels={CHANNELS}", "--raw"]
         else:
-            self.console.print("  [yellow]PA source not found, using ALSA direct[/yellow]")
-            kill_pulseaudio()
-            time.sleep(0.5)
-            plughw = hw.replace("hw:", "plughw:")
-            rec_cmd = ["arecord", "-D", plughw, "-f", "S16_LE", "-r", str(SAMPLE_RATE),
+            self.console.print("  [yellow]PA source not found, trying ALSA/Direct[/yellow]")
+            rec_cmd = ["arecord", "-D", hw.replace("hw:", "plughw:"), "-f", "S16_LE", "-r", str(SAMPLE_RATE),
                        "-c", str(CHANNELS), "-t", "raw"]
 
-        for attempt in range(3):
-            self._proc = subprocess.Popen(rec_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            time.sleep(0.5)
-            if self._proc.poll() is None:
-                break
-            err = self._proc.stderr.read().decode(errors="replace").strip()
-            self.console.print(f"  [red]Mic attempt {attempt+1} failed: {err}[/red]")
-            time.sleep(1)
+        # Check if commands exist before running
+        try:
+            from shutil import which
+            if which(rec_cmd[0]):
+                self._proc = subprocess.Popen(rec_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                time.sleep(0.5)
+                if self._proc.poll() is None:
+                    threading.Thread(target=self._reader, daemon=True).start()
+                    self.console.print(f"  Mic: [green]✓ {rec_cmd[0]} active[/green]")
+                    return True
+        except Exception:
+            pass
 
-        if self._proc is None or self._proc.poll() is not None:
+        # Fallback to sounddevice (cross-platform)
+        try:
+            import sounddevice as sd
+            self.console.print("  [yellow]Using sounddevice fallback (portable)[/yellow]")
+            def _sd_callback(indata, frames, time_info, status):
+                if status:
+                    print(status, file=sys.stderr)
+                if self.listening.is_set():
+                    self.audio_q.put(indata.copy().tobytes())
+            
+            self._sd_stream = sd.RawInputStream(
+                samplerate=SAMPLE_RATE, blocksize=self.chunk_samples,
+                channels=CHANNELS, dtype='int16', callback=_sd_callback
+            )
+            self._sd_stream.start()
+            return True
+        except Exception as e:
+            self.console.print(f"  [red]All mic methods failed: {e}[/red]")
             return False
 
-        threading.Thread(target=self._reader, daemon=True).start()
-
-        time.sleep(0.5)
-        test_chunks = []
-        for _ in range(10):
-            try:
-                test_chunks.append(self.audio_q.get(timeout=0.5))
-            except queue.Empty:
-                break
-        if test_chunks:
-            r = chunk_rms(b"".join(test_chunks))
-            if r > 0.003:
-                self.console.print("  Mic: [green]✓ live[/green]")
-            else:
-                self.console.print("  Mic: [red]✗ silent — unmute![/red]")
-        else:
-            self.console.print(
-                f"  [red]Mic: no audio data! arecord running: {self._proc.poll() is None}[/red]"
-            )
-
-        return True
-
     def _reader(self):
-        while self.alive:
+        while self.alive and self._proc:
             raw = self._proc.stdout.read(self.chunk_bytes)
             if not raw:
                 if self._proc.poll() is not None:
@@ -312,6 +327,9 @@ class MicRecorder:
         if self._proc:
             self._proc.terminate()
             self._proc.wait(timeout=2)
+        if hasattr(self, "_sd_stream") and self._sd_stream:
+            self._sd_stream.stop()
+            self._sd_stream.close()
 
 
 # ── VAD loop ──────────────────────────────────────────────────────

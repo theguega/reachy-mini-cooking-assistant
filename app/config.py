@@ -25,6 +25,7 @@ import yaml
 @dataclass
 class LLMConfig:
     model: str = ""
+    api_key: str = ""
     base_url: str = "http://localhost:8080"
     backend: str = "openai"
     max_tokens: int = 512
@@ -36,7 +37,9 @@ class LLMConfig:
 
 @dataclass
 class STTConfig:
+    backend: str = "faster-whisper"
     model: str = "base.en"
+    api_key: str = ""
     device: str = "cuda"
     compute_type: str = "int8"
     language: str = "en"
@@ -45,11 +48,25 @@ class STTConfig:
 
 @dataclass
 class TTSConfig:
+    backend: str = "kokoro"
     voice: str = "af_sarah"
+    api_key: str = ""
     speed: float = 1.0
     lang: str = "en-us"
     first_chunk_words: int = 3
     max_chunk_words: int = 8
+
+
+@dataclass
+class CookingConfig:
+    enabled: bool = True
+    system_prompt: str = (
+        "You are a professional cooking assistant. You help users with recipes, "
+        "ingredient discovery, and real-time cooking guidance using vision. "
+        "You should be friendly, encourage proper technique, and watch carefully."
+    )
+    instacart_enabled: bool = False
+    sign_language_enabled: bool = True
 
 
 @dataclass
@@ -137,6 +154,7 @@ _SECTIONS = [
     ("emotion", "emotion", EmotionConfig),
     ("rag", "rag", RAGConfig),
     ("web", "web", WebConfig),
+    ("cooking", "cooking", CookingConfig),
 ]
 
 
@@ -152,6 +170,7 @@ class Config:
     emotion: EmotionConfig = field(default_factory=EmotionConfig)
     rag: RAGConfig = field(default_factory=RAGConfig)
     web: WebConfig = field(default_factory=WebConfig)
+    cooking: CookingConfig = field(default_factory=CookingConfig)
 
     @classmethod
     def load(cls, config_path: Optional[str] = None) -> "Config":

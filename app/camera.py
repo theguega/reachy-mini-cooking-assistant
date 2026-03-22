@@ -186,6 +186,10 @@ class Camera:
             _, frame = self._ring[-1]
         return self._encode_frame(frame)
 
+    def get_latest_frame(self) -> Optional[str]:
+        """Alias for capture_single."""
+        return self.capture_single()
+
     def read_live(self) -> Optional[str]:
         """Read a fresh frame directly from the camera hardware.
 
