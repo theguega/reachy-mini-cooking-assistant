@@ -29,8 +29,22 @@ from app.reachy import connect as connect_reachy
 from app.stt import STT
 from app.tts import create_tts
 from app.web import Broadcaster, start_web_server
+from app.rag import KnowledgeBase, RAGRetriever
 
 console = Console()
+
+
+def handle_memory_storage(kb: KnowledgeBase, text: str):
+    """Check if the user wants Reachy to remember something."""
+    prefixes = ["remember that", "please remember", "keep in mind that", "save this:"]
+    for p in prefixes:
+        if text.lower().startswith(p):
+            fact = text[len(p) :].strip()
+            if fact:
+                kb.add_document(fact, metadata={"type": "cooking_memory"})
+                return f"Got it! I've added that to my memory: {fact}"
+    return None
+
 
 # ── Cooking Helpers ───────────────────────────────────────────
 
@@ -160,6 +174,23 @@ def main():
         console.print("  ⚠ TTS unavailable")
         tts = None
 
+    # ── Memory (RAG) ─────────────────────────────────────────────
+    kb = KnowledgeBase(
+        persist_dir=config.rag.persist_dir,
+        embedding_backend=config.rag.embedding_backend,
+        embedding_model=config.rag.embedding_model,
+        embedding_base_url=config.rag.embedding_base_url,
+        api_key=config.llm.api_key,  # Use same key for embeddings
+    )
+    if config.rag.enabled:
+        n_chunks, rebuilt = kb.sync_directory(config.rag.knowledge_dir)
+        status = "rebuilt" if rebuilt else "loaded"
+        console.print(f"  ✓ Memory ({status}, {n_chunks} chunks)")
+
+    retriever = RAGRetriever(
+        kb, n_results=config.rag.n_results, min_relevance=config.rag.min_relevance
+    )
+
     mover = (
         MovementController(reachy, config.reachy.antenna_rest_position)
         if reachy
@@ -199,43 +230,55 @@ def main():
             )
 
             # Transcribe
+            console.print(f"  [cyan]●[/cyan] Transcribing {segment.duration:.1f}s audio...")
             result = stt.transcribe(segment.audio, sample_rate=SAMPLE_RATE)
             text = result.get("text", "").strip()
 
             if not text:
+                console.print("  [dim]  (STT: no text returned)[/dim]")
                 mic.resume()
                 continue
 
             console.print(f'  [green]You:[/green] "{text}"')
             broadcaster.send({"type": "chat", "role": "user", "text": text})
 
+            # Memory storage check
+            mem_response = handle_memory_storage(kb, text)
+            if mem_response:
+                console.print(f"  [magenta]Assistant:[/magenta] {mem_response}")
+                broadcaster.send({"type": "chat", "role": "assistant", "text": mem_response})
+                if tts: tts.synthesize_to_file(mem_response, "/tmp/resp.wav")
+                mic.resume()
+                continue
+
             # Agentic tasks check
             timer_response = handle_timers(text)
             if timer_response:
                 console.print(f"  [magenta]Assistant:[/magenta] {timer_response}")
-                broadcaster.send(
-                    {"type": "chat", "role": "assistant", "text": timer_response}
-                )
-                if tts:
-                    tts.synthesize_to_file(timer_response, "/tmp/resp.wav")
-                # Simplified play for timer
+                broadcaster.send({"type": "chat", "role": "assistant", "text": timer_response})
+                if tts: tts.synthesize_to_file(timer_response, "/tmp/resp.wav")
                 mic.resume()
                 continue
 
-            # Sign Language trigger (example: trigger if "sign" or "show me" is mentioned)
-            if config.cooking.sign_language_enabled and (
-                "sign" in text.lower() or "show me" in text.lower()
-            ):
+            # Sign Language trigger
+            if config.cooking.sign_language_enabled and ("sign" in text.lower() or "show me" in text.lower()):
                 sign_with_antennas(mover, text)
 
+            # RAG Retrieval
+            prompt_text = text
+            if config.rag.enabled:
+                prompt_text = retriever.augment_query(text)
+
             # LLM Stream
+            n_imgs = len(captured_frames)
+            console.print(f"  [cyan]●[/cyan] Calling {config.llm.model} (VLM with {n_imgs} frames)...")
             console.print("  [magenta]Assistant:[/magenta] ", end="")
             sys.stdout.flush()
 
-            full_resp, _, _ = stream_and_speak(
+            full_resp, dt_llm, ttft = stream_and_speak(
                 llm,
                 tts,
-                text,
+                prompt_text,
                 config.cooking.system_prompt,
                 mic.pa_sink,
                 images_b64=captured_frames if captured_frames else None,

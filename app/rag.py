@@ -93,6 +93,38 @@ class OllamaEmbeddings(EmbeddingFunction):
         return out
 
 
+class OpenAIEmbeddings(EmbeddingFunction):
+    """Embeddings via OpenAI /v1/embeddings API."""
+
+    def __init__(self, api_key: str, model: str = "text-embedding-3-small", base_url: str = "https://api.openai.com/v1", timeout: float = 30.0):
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+
+    def __call__(self, input: Documents) -> Embeddings:
+        if not input:
+            return []
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        out = []
+        with httpx.Client(timeout=self.timeout) as c:
+            try:
+                r = c.post(f"{self.base_url}/embeddings", headers=headers, json={"model": self.model, "input": input})
+                if r.status_code == 200:
+                    data = r.json().get("data", [])
+                    # Sort by index to ensure order
+                    data.sort(key=lambda x: x["index"])
+                    for item in data:
+                        out.append(item.get("embedding", []))
+                else:
+                    print(f"OpenAI Embeddings error {r.status_code}: {r.text}")
+                    return [[0.0] * 1536] * len(input)
+            except Exception as e:
+                print(f"OpenAI Embeddings exception: {e}")
+                return [[0.0] * 1536] * len(input)
+        return out
+
+
 class LocalMiniLMEmbeddings(EmbeddingFunction):
     """Small in-process MiniLM embeddings (CPU)."""
 
@@ -118,6 +150,7 @@ class KnowledgeBase:
         embedding_backend: str = "llamacpp",
         embedding_model: str = "bge-small-en-v1.5",
         embedding_base_url: str = "http://localhost:8081",
+        api_key: str = "",
         chunk_size: int = 200,
         chunk_overlap: int = 20,
     ):
@@ -131,6 +164,9 @@ class KnowledgeBase:
         elif backend == "ollama":
             emb = OllamaEmbeddings(model=embedding_model)
             coll_name = "knowledge"
+        elif backend == "openai":
+            emb = OpenAIEmbeddings(api_key=api_key, model=embedding_model)
+            coll_name = "knowledge_openai"
         else:
             emb = LocalMiniLMEmbeddings(model_name=embedding_model)
             coll_name = "knowledge_local"
