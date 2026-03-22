@@ -369,7 +369,7 @@ def vad_loop(
     while mic.alive:
         try:
             raw = mic.audio_q.get(timeout=0.1)
-        except queue.Queue.Empty:
+        except queue.Empty:
             continue
 
         rms = chunk_rms(raw)
